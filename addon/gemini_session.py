@@ -1,50 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gemini Live Session Manager
+Gemini Live Session – refaktoryzowany i gotowy do produkcji.
 
-* Strumieniowo przesyła PCM (16‑bit, 16 kHz, mono) do modelu
-  `gemini‑3.8‑live`.
-* Obsługuje **non‑blocking tools** – wywołania funkcji są wykonywane w tle,
-  a model kontynuuje wypowiedź.
-* Po każdej zakończonej turze nie zamyka połączenia, lecz czeka na kolejne
-  wypowiedzi użytkownika.  Gdy nie wykryje żadnej aktywności przez
-  **15 s** (wartość konfigurowalna) sesja jest zamykana.
-* Zwracany wynik jest typem `GeminiTurnResult` zawierającym:
-  - tekst wypowiedzi modelu,
-  - listę wywołanych funkcji (czytelny łańcuch),
-  - surowe kawałki audio do odtworzenia po stronie klienta.
-
-Wymagane zależności (pip):
-    google‑generativeai, structlog, numpy, aiohttp, python‑dotenv
-oraz dostęp do klucza API Gemini (`GEMINI_API_KEY`) i ewentualnie
-klucza SerpAPI (`SERPAPI_KEY`) używanego w `ai_common.web_search`.
-
+* Strumieniujemy PCM (16‑bit, 16 kHz, mono) do modelu gemini‑3.8‑live.
+* Narzędzia (search, HA‑actions) są uruchamiane asynchronicznie (NON_BLOCKING).
+* Po każdej turze modelu nie zamykamy połączenia – czekamy na kolejne
+  wypowiedzi użytkownika.  Sesja zostaje zamknięta po 15 s ciszy
+  (wartość konfigurowalna przez env `GEMINI_SILENCE_DURATION_MS`).
+* W razie limitu 429 przy `search_web` używamy DuckDuckGo jako fallback
+  i zwracamy przyjazny komunikat.
+* Logowanie jest realizowane przez ``structlog``.
 """
 
 # ----------------------------------------------------------------------
-#  IMPORTY
+# IMPORTY
 # ----------------------------------------------------------------------
-from __future__ import annotations
-
 import asyncio
 import json
 import os
 import time
 import structlog
 from dataclasses import dataclass, field
-from typing import (
-    AsyncGenerator,
-    Awaitable,
-    Callable,
-    List,
-    Tuple,
-)
+from typing import AsyncGenerator, Awaitable, Callable, List, Tuple
 
-# Google Gemini SDK
 from google.generativeai import genai, types
 
-# Wspólne helpery z Twojego projektu (muszą znajdować się w PYTHONPATH)
+# ----------------------------------------------------------------------
+# MODUŁY WŁASNE
+# ----------------------------------------------------------------------
+# ``ai_common`` musi być w PYTHONPATH (zawiera m.in. build_prompt,
+# build_tool_specs, web_search, QUIET_CONFIRMATIONS itp.).
 from ai_common import (
     ASSISTANT_LANGUAGE,
     QUIET_CONFIRMATIONS,
@@ -54,63 +40,126 @@ from ai_common import (
 )
 
 # ----------------------------------------------------------------------
-#  KONFIGURACJA I STALE
+# KONFIGURACJA I STAŁE
 # ----------------------------------------------------------------------
 log = structlog.get_logger(__name__)
 
-
 def _env(name: str, default: str) -> str:
-    """
-    Pobiera wartość ze środowiska. Jeśli zmienna jest pusta,
-    równa „null” (w sensie BashIO) lub nie istnieje – zwraca ``default``.
-    """
+    """Wczytuje zmienną środowiskową (obsługuje 'null' zwracane przez bashio)."""
     val = (os.getenv(name) or "").strip()
     return default if not val or val.lower() == "null" else val
 
 
-# Model i głos – można nadpisać zmiennymi środowiskowymi
-GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.8-live")
-GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
+GEMINI_MODEL     = _env("GEMINI_MODEL", "gemini-3.8-live")
+GEMINI_VOICE     = os.getenv("GEMINI_VOICE", "Vega")
+PCM_RATE         = 16000                     # musi pasować do enkodera w kliencie
+SILENCE_TIMEOUT  = float(os.getenv("GEMINI_SILENCE_DURATION_MS", "15000")) / 1000.0
 
-# PCM‑rate – musi zgadzać się z tym, co koduje front‑end.
-PCM_RATE = 16000  # Hz
-
-# --------------------------- timeouty (sekundy) -----------------------
+# ----------------------------------------------------------------------
+# TIMEOUTY (sekundy) – używane w pętli odbioru
+# ----------------------------------------------------------------------
 class IdleTimeouts:
-    """Timeouty wykorzystywane w pętli odbioru."""
     AFTER_FUNCTION = float(os.getenv("RECEIVE_IDLE_TIMEOUT_AFTER_FUNCTION", "1.5"))
-    AFTER_AUDIO = float(os.getenv("RECEIVE_IDLE_TIMEOUT_AFTER_AUDIO", "1.2"))
-    GENERAL = float(os.getenv("RECEIVE_IDLE_TIMEOUT_GENERAL", "8.0"))
-    AWAITING_REPLY = float(os.getenv("RECEIVE_IDLE_TIMEOUT_AWAITING_REPLY", "5.0"))
+    AFTER_AUDIO    = float(os.getenv("RECEIVE_IDLE_TIMEOUT_AFTER_AUDIO",   "1.2"))
+    GENERAL        = float(os.getenv("RECEIVE_IDLE_TIMEOUT_GENERAL",       "8.0"))
+    AWAITING_REPLY = float(os.getenv("RECEIVE_IDLE_TIMEOUT_AWAITING_REPLY","5.0"))
 
 
-# Cisza, po której sesja zostaje zamknięta (wartość w milisekundach → sekundy)
-SILENCE_TIMEOUT_SEC = float(os.getenv("GEMINI_SILENCE_DURATION_MS", "15000")) / 1000.0
+# ----------------------------------------------------------------------
+# KLASA STANU SESJI
+# ----------------------------------------------------------------------
+@dataclass
+class SessionState:
+    """Wszystkie pola, które zmieniają się podczas działania jednej sesji."""
+    input_transcript: List[str] = field(default_factory=list)   # co model usłyszał (transkrypcja)
+    output_transcript: List[str] = field(default_factory=list)  # co model powiedział (tekst)
+    audio_out_chunks: List[bytes] = field(default_factory=list) # surowe audio (PCM/Opus)
+
+    pending_fc: List[str] = field(default_factory=list)   # np. "search_web(query='…')"
+    tools_running: int = 0
+    tools_done: asyncio.Event = field(default_factory=asyncio.Event)
+
+    turn_open: bool = False
+    reply_owed: bool = False
+    responding_signaled: bool = False
+
+    last_response_ts: float = 0.0
+    last_audio_ts: float = 0.0
+
+    send_done: bool = False
+
+    # Event który jest ustawiany przy każdej aktywności (audio, turn, tool)
+    activity_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    # Flaga zamknięcia po wykryciu ciszy
+    shutdown_requested: bool = False
+
+    # Id sesji – przydatne w logach
+    session_id: str = field(default_factory=lambda: os.urandom(6).hex())
 
 
-# --------------------------- dźwięk potwierdzenia --------------------
-def make_confirm_chime(sample_rate: int = 24000) -> bytes:
-    """Krótki, dwutonowy dźwięk potwierdzający (PCM16 mono)."""
-    import numpy as np
-
-    notes = [(0.07, 880.0), (0.11, 1318.5)]
-    parts = []
-    for dur, freq in notes:
-        t = np.arange(int(sample_rate * dur)) / sample_rate
-        envelope = np.minimum(1.0, t / 0.008) * np.exp(-t * 18)
-        parts.append(np.sin(2 * np.pi * freq * t) * envelope)
-    wave = np.concatenate(parts + [np.zeros(int(sample_rate * 0.05))])
-    return (wave * 7000).astype(np.int16).tobytes()
+# ----------------------------------------------------------------------
+#  REZULTAT JEDNEJ TURY / SESJI
+# ----------------------------------------------------------------------
+@dataclass
+class GeminiTurnResult:
+    """Wartość zwracana przez ``GeminiSession.stream_audio``."""
+    spoken_text: str                  # kompletna treść wypowiedzi modelu
+    tool_calls: str                   # lista wywołań narzędzi w formie tekstowej
+    audio_chunks: List[bytes]           # audio do odtworzenia po stronie UI
 
 
-CONFIRM_CHIME = make_confirm_chime()
+# ----------------------------------------------------------------------
+#  FUNKCJE POMOCNICZE
+# ----------------------------------------------------------------------
+def _build_tool_decls(room_keys: Tuple[str, ...], vacuum_enabled: bool) -> List[types.Tool]:
+    """Konwertuje specyfikację z ``ai_common.build_tool_specs`` na deklaracje Gemini."""
+    decls = [
+        types.FunctionDeclaration(
+            name=spec["name"],
+            description=spec["description"],
+            parameters=spec["parameters"],
+            behavior=types.Behavior.NON_BLOCKING,
+        )
+        for spec in build_tool_specs(list(room_keys), vacuum_enabled)
+    ]
+    return [types.Tool(function_declarations=decls)]
+
+
+def _choose_idle_timeout(state: SessionState) -> float:
+    """Wybiera najbardziej adekwatny timeout w zależności od bieżącego stanu."""
+    if state.tools_running:
+        return IdleTimeouts.GENERAL
+    if state.reply_owed:
+        return IdleTimeouts.AWAITING_REPLY
+    if state.pending_fc and state.audio_out_chunks:
+        return IdleTimeouts.AFTER_AUDIO
+    if state.pending_fc:
+        return IdleTimeouts.AFTER_FUNCTION
+    return IdleTimeouts.GENERAL
+
+
+async def _silence_watcher(state: SessionState) -> None:
+    """
+    Czeka ``SILENCE_TIMEOUT`` sekund na brak aktywności.
+    Gdy timeout wygaśnie → ustawiamy ``state.shutdown_requested = True``.
+    """
+    while not state.shutdown_requested:
+        try:
+            await asyncio.wait_for(state.activity_event.wait(),
+                                   timeout=SILENCE_TIMEOUT)
+            # Aktywność – wyzeruj flagę i kontynuuj oczekiwanie
+            state.activity_event.clear()
+        except asyncio.TimeoutError:
+            log.info("gemini.silence_timeout",
+                     timeout=SILENCE_TIMEOUT,
+                     session=state.session_id)
+            state.shutdown_requested = True
+            break
 
 
 def _is_quiet_tool(name: str, result: dict) -> bool:
-    """
-    Czy narzędzie jest „ciche” – zwraca ``True`` wtedy, gdy model nie musi
-    wypowiadać żadnego zdania, a jedynie odtworzyć sygnał dźwiękowy.
-    """
+    """Czy narzędzie jest „ciche” (potwierdzenie wyłącznie dźwiękiem)."""
     QUIET_TOOLS = {
         "control_device",
         "control_room",
@@ -125,115 +174,23 @@ def _is_quiet_tool(name: str, result: dict) -> bool:
         return False
     if result.get("status") != "ok" or result.get("no_change"):
         return False
-    # ``count`` == 0 oznacza, że nic się nie zmieniło – nie wymaga wypowiedzi.
     return result.get("count", 1) != 0
 
 
-# ----------------------------------------------------------------------
-#  DANE STANU SESJI
-# ----------------------------------------------------------------------
-@dataclass
-class SessionState:
-    """Wszystkie pola, które zmieniają się w czasie trwania jednej sesji."""
-    # Transkrypcje
-    input_transcript: List[str] = field(default_factory=list)
-    output_transcript: List[str] = field(default_factory=list)
-
-    # Zgromadzone audio, które trzeba odtworzyć po stronie klienta
-    audio_out_chunks: List[bytes] = field(default_factory=list)
-
-    # Lista wywołanych funkcji w formie czytelnego stringa
-    pending_fc: List[str] = field(default_factory=list)
-
-    # Licznik uruchomionych asynchronicznie narzędzi
-    tools_running: int = 0
-    tools_done: asyncio.Event = field(default_factory=asyncio.Event)
-
-    # Informacje o bieżącej turze modelu
-    turn_open: bool = False
-    reply_owed: bool = False          # model już wypowiedział, ale czeka na wynik narzędzia
-    responding_signaled: bool = False
-
-    # Timestampy (float – wynik time.monotonic())
-    last_response_ts: float = 0.0
-    last_audio_ts: float = 0.0
-
-    # Czy wysłano już wszystkie dane audio od klienta?
-    send_done: bool = False
-
-    # Event ustawiany przy każdej aktywności (audio, turn, tool)
-    activity_event: asyncio.Event = field(default_factory=asyncio.Event)
-
-    # Czy sesja ma się już zamknąć (po wykryciu ciszy)?
-    shutdown_requested: bool = False
+def make_confirm_chime(sample_rate: int = 24000) -> bytes:
+    """Krótki, dwutonowy dźwięk potwierdzający (PCM16 mono)."""
+    import numpy as np
+    notes = [(0.07, 880.0), (0.11, 1318.5)]
+    parts = []
+    for dur, freq in notes:
+        t = np.arange(int(sample_rate * dur)) / sample_rate
+        envelope = np.minimum(1.0, t / 0.008) * np.exp(-t * 18)
+        parts.append(np.sin(2 * np.pi * freq * t) * envelope)
+    wave = np.concatenate(parts + [np.zeros(int(sample_rate * 0.05))])
+    return (wave * 7000).astype(np.int16).tobytes()
 
 
-# ----------------------------------------------------------------------
-#  REZULTAT JEDNEJ TURY / SESJI
-# ----------------------------------------------------------------------
-@dataclass
-class GeminiTurnResult:
-    """Co zwraca metoda ``stream_audio``."""
-    spoken_text: str                # pełny tekst wypowiedzi modelu
-    tool_calls: str                 # spis wywołań narzędzi, np. "search_web(query='…')"
-    audio_chunks: List[bytes]       # surowe PCM/Opus do odtworzenia w UI
-
-
-# ----------------------------------------------------------------------
-#  FUNKCJE POMOCNICZE
-# ----------------------------------------------------------------------
-def _build_tool_decls(room_keys: Tuple[str, ...], vacuum_enabled: bool) -> List[types.Tool]:
-    """
-    Przekształca specyfikację narzędzi z ``ai_common.build_tool_specs`` na
-    ``types.FunctionDeclaration`` zgodne z Gemini.
-    Wszystkie narzędzia mają zachowanie NON_BLOCKING.
-    """
-    decls = [
-        types.FunctionDeclaration(
-            name=spec["name"],
-            description=spec["description"],
-            parameters=spec["parameters"],
-            behavior=types.Behavior.NON_BLOCKING,
-        )
-        for spec in build_tool_specs(list(room_keys), vacuum_enabled)
-    ]
-    return [types.Tool(function_declarations=decls)]
-
-
-def _choose_idle_timeout(state: SessionState) -> float:
-    """
-    Zależnie od bieżącego stanu wybiera najodpowiedniejszy timeout
-    (z klasy ``IdleTimeouts``).
-    """
-    if state.tools_running:
-        return IdleTimeouts.GENERAL
-    if state.reply_owed:
-        return IdleTimeouts.AWAITING_REPLY
-    if state.pending_fc and state.audio_out_chunks:
-        return IdleTimeouts.AFTER_AUDIO
-    if state.pending_fc:
-        return IdleTimeouts.AFTER_FUNCTION
-    return IdleTimeouts.GENERAL
-
-
-async def _silence_watcher(state: SessionState) -> None:
-    """
-    Czeka na ``SILENCE_TIMEOUT_SEC`` sekund bez żadnej aktywności.
-    Gdy timeout wygaśnie – ustawia ``state.shutdown_requested = True``,
-    co powoduje zamknięcie połączenia.
-    """
-    while not state.shutdown_requested:
-        try:
-            await asyncio.wait_for(state.activity_event.wait(),
-                                   timeout=SILENCE_TIMEOUT_SEC)
-            # Aktywność została wykryta – czyścimy flagę i czekamy dalej
-            state.activity_event.clear()
-        except asyncio.TimeoutError:
-            log.info("gemini.silence_timeout",
-                     timeout=SILENCE_TIMEOUT_SEC,
-                     session=getattr(state, "session_id", "unknown"))
-            state.shutdown_requested = True
-            break
+CONFIRM_CHIME = make_confirm_chime()
 
 
 # ----------------------------------------------------------------------
@@ -241,12 +198,7 @@ async def _silence_watcher(state: SessionState) -> None:
 # ----------------------------------------------------------------------
 class GeminiSession:
     """
-    Zarządza jedną sesją Gemini Live.
-    - Odbiera strumień PCM od klienta.
-    - Przesyła go do modelu (manualne VAD).
-    - Odbiera odpowiedzi audio + tekst, a także wywołania funkcji.
-    - Wykonuje funkcje asynchronicznie, odsyła ich wyniki do modelu.
-    - Po 15 s ciszy zamyka sesję.
+    Główna klasa zarządzająca jedną sesją Gemini Live.
     """
 
     def __init__(
@@ -272,19 +224,12 @@ class GeminiSession:
         self.on_responding = on_responding
         self.vacuum_enabled = vacuum_enabled
         self.local_area_id = local_area_id
-
-        # Krótkie ID sesji – przydatne w logach/metricach
-        self.session_id = os.urandom(6).hex()
-        self._t0: float = 0.0
+        self.session_id = os.urandom(6).hex()      # przydatne w logach
 
     # ------------------------------------------------------------------
-    # 1️⃣ Budowanie promptu i konfiguracji LiveConnect
+    # 1️⃣ Budowanie promptu i konfiguracji
     # ------------------------------------------------------------------
     def _build_prompt(self) -> str:
-        """
-        Składa pełny prompt systemowy (z historią, kontekstem itp.)
-        i dopina informacje o zachowaniu NON_BLOCKING tools.
-        """
         from ai_common import build_prompt
 
         prompt = build_prompt(
@@ -293,28 +238,24 @@ class GeminiSession:
             self.history,
             self.local_area_id,
         )
-
         async_tools_prompt = (
             "\n\nNarzędzia wykonują się w tle. Po wywołaniu narzędzia sterującego "
             "NIE potwierdzaj wykonania, zanim dostaniesz wynik — potwierdź dopiero "
             "na podstawie wyniku. "
             "Wyjątek: zanim wywołasz search_web albo inne narzędzie pobierające "
-            "informacje z internetu, powiedz najpierw jedno bardzo krótkie zdanie, "
-            "np. „Już sprawdzam.”, a dopiero potem wywołaj narzędzie. "
-            "Przy sterowaniu urządzeniami, scenami i timerami nic nie mów przed "
-            "wywołaniem."
+            "informacje z internetu, powiedz najpierw bardzo krótkie zdanie, np. "
+            "„Już sprawdzam.”, a dopiero potem wywołaj narzędzie."
         )
         return prompt + async_tools_prompt
 
     def _live_config(self, room_keys: Tuple[str, ...]) -> types.LiveConnectConfig:
-        """Konfiguracja LiveConnect – audio, VAD, system‑prompt i tools."""
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=self.voice,
-                    ),
+                        voice_name=self.voice
+                    )
                 ),
                 language_code=ASSISTANT_LANGUAGE,
             ),
@@ -333,7 +274,7 @@ class GeminiSession:
         )
 
     # ------------------------------------------------------------------
-    # 2️⃣ Wysyłanie audio do Gemini (ręczne VAD)
+    # 2️⃣ Wysyłanie audio (ręczne VAD)
     # ------------------------------------------------------------------
     async def _send_audio(
         self,
@@ -341,16 +282,12 @@ class GeminiSession:
         sess: types.LiveConnect,
         state: SessionState,
     ) -> None:
-        """Przesyła podany strumień PCM do Gemini, sygnalizując start/end VAD."""
+        """Przesyła PCM → Gemini. Pierwszy chunk uruchamia ``activity_start``."""
         chunk_no = 0
         async for chunk in audio_chunks:
             chunk_no += 1
             if chunk_no == 1:
-                log.debug(
-                    "gemini.send.start",
-                    session=self.session_id,
-                )
-                # pierwszy pakiet → sygnał początku wypowiedzi użytkownika
+                log.debug("gemini.send.start", session=self.session_id)
                 await sess.send_realtime_input(activity_start=types.ActivityStart())
             await sess.send_realtime_input(
                 audio=types.Blob(
@@ -358,21 +295,17 @@ class GeminiSession:
                     mime_type=f"audio/pcm;rate={PCM_RATE}",
                 )
             )
-            # Każdy przychodzący fragment PCM liczy się jako aktywność
+            # Każdy przychodzący fragment PCM jest aktywnością
             state.activity_event.set()
 
-        # Koniec strumienia – ręczny VAD
+        # Koniec strumienia audio – ręczne VAD
         if chunk_no:
             await sess.send_realtime_input(activity_end=types.ActivityEnd())
         else:
             await sess.send_realtime_input(audio_stream_end=True)
 
         state.send_done = True
-        log.debug(
-            "gemini.send.end",
-            chunks=chunk_no,
-            session=self.session_id,
-        )
+        log.debug("gemini.send.end", chunks=chunk_no, session=self.session_id)
 
     # ------------------------------------------------------------------
     # 3️⃣ Wykonywanie batcha funkcji (tool‑call)
@@ -384,77 +317,58 @@ class GeminiSession:
         state: SessionState,
     ) -> None:
         """
-        Uruchamia wszystkie funkcje z jednego wywołania ``tool_call`` równolegle.
-        Po zakończeniu odsyła wyniki do Gemini (z opcjonalnym ``SILENT``).
+        Uruchamia wszystkie funkcje z jednego ``tool_call`` równolegle,
+        po czym odsyła ich wyniki do Gemini.
         """
-
         async def _exec_one(fc: types.FunctionCall) -> dict:
             args = dict(fc.args)
             try:
                 if fc.name == "search_web":
-                    # własna metoda, korzystająca z web_search()
-                    return await asyncio.wait_for(self._do_search(args.get("query", "")),
-                                                timeout=8)
-                # domyślna funkcja – wywołana z kodu Home‑Assistant
-                return await asyncio.wait_for(
-                    self.on_function_call(fc.name, args), timeout=8
-                )
-            except asyncio.TimeoutError:
-                return {"status": "error", "message": f"{fc.name} timed out"}
-            except Exception as exc:  # noqa: BLE001
-                log.error(
-                    "tool.exception",
-                    name=fc.name,
-                    error=str(exc),
-                    session=self.session_id,
-                )
+                    # Najpierw spróbuj użyć Gemini + Google Search, po 429 fallback do DuckDuckGo
+                    return await self._search_with_fallback(args.get("query", ""))
+                # Inne funkcje – wywołanie dostarczonego callbacka
+                return await self.on_function_call(fc.name, args)
+            except Exception as exc:   # noqa: BLE001
+                log.error("tool.exception",
+                          name=fc.name,
+                          error=str(exc),
+                          session=self.session_id)
                 return {"status": "error", "message": str(exc)}
 
-        # ---------------------------------
-        # Uruchomienie wszystkich funkcji
-        # ---------------------------------
         results = await asyncio.gather(*[_exec_one(fc) for fc in calls])
 
-        # Czy wszystkie wyniki są "ciche" (tylko dźwięk)?
         quiet = QUIET_CONFIRMATIONS and all(
             _is_quiet_tool(fc.name, res) for fc, res in zip(calls, results)
         )
-        extra = {}
-        if quiet:
-            extra["scheduling"] = types.FunctionResponseScheduling.SILENT
+        extra = {"scheduling": types.FunctionResponseScheduling.SILENT} if quiet else {}
 
         await sess.send_tool_response(
             function_responses=[
-                types.FunctionResponse(
-                    id=fc.id,
-                    name=fc.name,
-                    response=res,
-                    **extra,
-                )
+                types.FunctionResponse(id=fc.id,
+                                      name=fc.name,
+                                      response=res,
+                                      **extra)
                 for fc, res in zip(calls, results)
             ]
         )
-        log.debug(
-            "gemini.tools.sent",
-            quiet=quiet,
-            elapsed_ms=int((time.monotonic() - self._t0) * 1000),
-            session=self.session_id,
-        )
+        log.debug("gemini.tools.sent",
+                  quiet=quiet,
+                  elapsed_ms=int((time.monotonic() - self._t0) * 1000),
+                  session=self.session_id)
 
         if quiet:
-            # odtwórz jedynie dźwięk potwierdzający
+            # Odgrywamy jedynie dźwięk potwierdzenia
             state.audio_out_chunks.append(CONFIRM_CHIME)
             await self._audio_sink(CONFIRM_CHIME)
         else:
             state.reply_owed = True
             state.last_response_ts = time.monotonic()
 
-        # Updating counters
         state.tools_running -= 1
         state.tools_done.set()
 
     # ------------------------------------------------------------------
-    # 4️⃣ Odbiór i obsługa wiadomości od Gemini
+    # 4️⃣ Odbiór wiadomości od Gemini
     # ------------------------------------------------------------------
     async def _receive_loop(
         self,
@@ -463,80 +377,65 @@ class GeminiSession:
         audio_sink: Callable[[bytes], Awaitable[None]],
     ) -> None:
         """
-        Główna pętla odbierająca wiadomości z Gemini.
-        - Zapamiętuje transkrypcje.
-        - Zbiera audio i tekst modelu.
-        - Wykrywa wywołania narzędzi i uruchamia ``_run_tool_batch``.
-        - Po każdej istotnej aktywności wywołuje ``state.activity_event.set()``.
+        Nasłuchuje strumienia Gemini, aktualizuje stan i uruchamia narzędzia.
+        Każde przyjęte zdarzenie (audio, turn, tool) wywołuje
+        ``state.activity_event.set()`` – w ten sposób watchdog odświeża timeout.
         """
         self._audio_sink = audio_sink
 
-        next_msg_fut: asyncio.Future | None = None
+        next_msg: asyncio.Future | None = None
         msgs = sess.receive().__aiter__()
 
         while not state.shutdown_requested:
             timeout = _choose_idle_timeout(state)
 
-            if next_msg_fut is None:
-                next_msg_fut = asyncio.ensure_future(msgs.__anext__())
+            if next_msg is None:
+                next_msg = asyncio.ensure_future(msgs.__anext__())
             tools_waiter = asyncio.ensure_future(state.tools_done.wait())
 
             done, _ = await asyncio.wait(
-                {next_msg_fut, tools_waiter},
+                {next_msg, tools_waiter},
                 timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             tools_waiter.cancel()
 
-            # -----------------------------------------------------------
-            #  a) Zakończyły się wszystkie narzędzia -> ewentualny koniec
-            # -----------------------------------------------------------
+            # ------------------- wszystkie narzędzia skończyły -------------------
             if tools_waiter in done:
                 state.tools_done.clear()
-                if (
-                    state.tools_running == 0
-                    and not state.reply_owed
-                    and not state.turn_open
-                ):
-                    log.debug(
-                        "gemini.quiet_tool_end",
-                        session=self.session_id,
-                    )
+                if state.tools_running == 0 and not state.reply_owed and not state.turn_open:
+                    log.debug("gemini.quiet_tool_end",
+                              session=self.session_id)
                     break
                 continue
 
-            # -----------------------------------------------------------
-            #  b) Timeout – brak nowych wiadomości od Gemini
-            # -----------------------------------------------------------
-            if next_msg_fut not in done:
-                log.debug(
-                    "gemini.idle_timeout",
-                    timeout=timeout,
-                    state=state,
-                    session=self.session_id,
-                )
+            # ------------------- timeout -------------------
+            if next_msg not in done:
+                log.debug("gemini.idle_timeout",
+                          timeout=timeout,
+                          state=state,
+                          session=self.session_id)
                 break
 
-            # -----------------------------------------------------------
-            #  c) Otrzymano wiadomość
-            # -----------------------------------------------------------
+            # ------------------- odebrano wiadomość -------------------
             try:
-                msg = next_msg_fut.result()
+                message = next_msg.result()
             except StopAsyncIteration:
-                # iterator zakończył się po turze – wracamy do nasłuchiwania
-                next_msg_fut = None
+                # Iterator zakończył się po „turn_complete”.  Nie przerywamy,
+                # po prostu wracamy do nasłuchiwania kolejnych zdarzeń.
+                next_msg = None
                 if state.tools_running or state.reply_owed:
                     msgs = sess.receive().__aiter__()
                     continue
                 break
             finally:
-                next_msg_fut = None
+                next_msg = None
 
-            # Każda przyjęta wiadomość jest **aktywnością**
+            # Każda wiadomość = aktywność → resetujemy watchdog.
             state.activity_event.set()
 
-            # ----------------- debugowanie pól wiadomości -----------------
-            msg_fields = [
+            # ----------------- diagnostyka -----------------
+            fields = [
                 n
                 for n in (
                     "setup_complete",
@@ -547,44 +446,32 @@ class GeminiSession:
                     "go_away",
                     "session_resumption_update",
                 )
-                if getattr(msg, n, None) is not None
+                if getattr(message, n, None) is not None
             ]
-            if msg.server_content:
-                msg_fields += [
+            if sc := message.server_content:
+                fields += [
                     n
                     for n in ("generation_complete", "turn_complete", "interrupted")
-                    if getattr(msg.server_content, n, None)
+                    if getattr(sc, n, None)
                 ]
+            log.debug("gemini.msg",
+                      fields=fields,
+                      session=self.session_id)
 
-            log.debug(
-                "gemini.msg",
-                fields=msg_fields,
-                session=self.session_id,
-            )
-
-            sc = msg.server_content
-            # -----------------------------------------------------------
-            #   Server content – transkrypcje i audio modelu
-            # -----------------------------------------------------------
+            # ----------------- SERVER CONTENT -----------------
             if sc:
                 if sc.input_transcription and sc.input_transcription.text:
                     state.input_transcript.append(sc.input_transcription.text)
                 if sc.output_transcription and sc.output_transcription.text:
                     state.output_transcript.append(sc.output_transcription.text)
 
-                # -----------------------------------------------------------------
-                # Model turn – audio (inline_data) i ewentualny tekst (part.text)
-                # -----------------------------------------------------------------
+                # ---- model turn (audio + ewentualny tekst) ----
                 if sc.model_turn:
                     state.turn_open = True
                     if not state.responding_signaled:
                         state.responding_signaled = True
                         if self.on_responding:
                             self.on_responding()
-                        log.debug(
-                            "gemini.responding",
-                            session=self.session_id,
-                        )
                     for part in sc.model_turn.parts:
                         if part.inline_data:
                             state.audio_out_chunks.append(part.inline_data.data)
@@ -593,69 +480,55 @@ class GeminiSession:
                         if part.text:
                             state.output_transcript.append(part.text)
 
-                # ------------------------------------------------------------
-                # Turn zakończona – ale nie zamykamy sesji, wracamy do nasłuchiwania
-                # ------------------------------------------------------------
+                # ---- zakończenie tury ----
                 if sc.turn_complete or sc.generation_complete:
                     state.turn_open = False
-                    # Jeśli po narzędziu model już wypowiedział coś i audio już dotarło,
-                    # uznajemy, że zaległa odpowiedź została "spłacona".
+                    # Jeśli odtwarzane audio już dotarło po wywołaniu narzędzia,
+                    # uznajemy, że odpowiedź została już wypowiedziana.
                     if state.reply_owed and state.last_audio_ts > state.last_response_ts:
                         state.reply_owed = False
-                    # Jeśli nadal czekamy na wynik narzędzia lub na kolejny obrót,
-                    # nie przerywamy pętli – po prostu czekamy dalej.
+                    # Jeśli jeszcze czekamy na wynik narzędzia – pozostajemy w pętli.
                     if state.tools_running or state.reply_owed:
-                        log.debug(
-                            "gemini.turn_done_waiting",
-                            tools=state.tools_running,
-                            reply_owed=state.reply_owed,
-                            session=self.session_id,
-                        )
+                        log.debug("gemini.turn_complete_waiting",
+                                  tools=state.tools_running,
+                                  reply_owed=state.reply_owed,
+                                  session=self.session_id)
                         continue
-                    # Normalny koniec tury – wracamy do nasłuchiwania nowych
-                    # zdarzeń (audio lub tool‑call).  Nie wychodzimy z pętli.
+                    # Normalny koniec tury – wracamy do nasłuchiwania.
                     continue
 
-            # -----------------------------------------------------------
-            #   Tool call – uruchomiamy batch w tle
-            # -----------------------------------------------------------
-            if msg.tool_call:
+            # ----------------- TOOL CALL -----------------
+            if tc := message.tool_call:
                 state.turn_open = True
                 if not state.responding_signaled:
                     state.responding_signaled = True
                     if self.on_responding:
                         self.on_responding()
-                    log.debug(
-                        "gemini.tool_call_received",
-                        session=self.session_id,
-                    )
-                for fc in msg.tool_call.function_calls:
+                for fc in tc.function_calls:
                     state.pending_fc.append(f"{fc.name}({dict(fc.args)})")
                 state.tools_running += 1
-                asyncio.create_task(self._run_tool_batch(msg.tool_call.function_calls,
-                                                        sess,
-                                                        state))
+                # Uruchamiamy batch w tle – nie blokujemy odbioru kolejnych pkt audio.
+                asyncio.create_task(self._run_tool_batch(tc.function_calls,
+                                                         sess,
+                                                         state))
 
-        # -----------------------------------------------------------
-        # Po wyjściu z pętli – czekamy (max 10 s) na wszystkie wciąż uruchomione narzędzia
-        # -----------------------------------------------------------
+        # -------------------------------------------------------
+        # Po wyjściu z pętli: czekamy (max 10 s) na narzędzia,
+        # które wciąż mogą działać.
+        # -------------------------------------------------------
         if state.tools_running:
-            log.debug(
-                "gemini.waiting_for_tools",
-                remaining=state.tools_running,
-                session=self.session_id,
-            )
+            log.debug("gemini.waiting_for_tools",
+                      remaining=state.tools_running,
+                      session=self.session_id)
             try:
                 await asyncio.wait_for(state.tools_done.wait(), timeout=10)
             except asyncio.TimeoutError:
-                log.warning(
-                    "gemini.tools_still_running_after_timeout",
-                    remaining=state.tools_running,
-                    session=self.session_id,
-                )
+                log.warning("gemini.tools_not_finished_after_timeout",
+                            remaining=state.tools_running,
+                            session=self.session_id)
 
     # ------------------------------------------------------------------
-    # 5️⃣ Publiczna metoda – jednorazowa sesja (z czatem) / odtwarzanie audio
+    # 5️⃣ Publiczna metoda – uruchamia jedną sesję (audio ↔ Gemini)
     # ------------------------------------------------------------------
     async def stream_audio(
         self,
@@ -663,12 +536,13 @@ class GeminiSession:
         on_audio_out: Callable[[bytes], Awaitable[None]],
     ) -> GeminiTurnResult:
         """
-        Strumieniuje podany audio do Gemini Live, obsługuje tool‑calls i zwraca
-        rezultat po zakończeniu sesji (lub po wykryciu 15 s ciszy).
+        - Strumieniuje podany PCM → Gemini Live.
+        - Obsługuje tool‑calls (z fallbackiem przy 429).
+        - Pozostawia sesję otwartą, dopóki nie nastąpi 15 s ciszy.
+        - Zwraca ``GeminiTurnResult``.
         """
         self._t0 = time.monotonic()
         state = SessionState()
-        # Dzięki ``session_id`` możemy szybciej identyfikować logi
         state.session_id = self.session_id
 
         config = self._live_config(tuple(self.room_lights.keys()))
@@ -677,45 +551,40 @@ class GeminiSession:
             model=GEMINI_MODEL,
             config=config,
         ) as sess:
-            # Uruchamiamy watchdog monitorujący ciszę
+            # -------- watchdog ciszy ----------
             watcher = asyncio.create_task(_silence_watcher(state))
 
-            # Uruchamiamy dwa główne zadania – wysyłanie i odbiór
+            # -------- dwa równoległe zadania: send / receive ----------
             send_task = asyncio.create_task(self._send_audio(audio_chunks, sess, state))
             recv_task = asyncio.create_task(self._receive_loop(sess, state, on_audio_out))
 
-            # Czekamy, aż jedno z trzech zadań zakończy się:
-            #   * watchdog wykryje ciszę,
-            #   * wysyłanie audio się skończy (klient zamknął połączenie),
-            #   * odbiór napotka nieodrecoverable błąd.
+            # -------- czekamy na dowolny sygnał zakończenia (watcher, błąd, zamknięcie) ----------
             while not state.shutdown_requested:
                 done, _ = await asyncio.wait(
                     {send_task, recv_task, watcher},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if watcher in done:
-                    # Cisza → zamykamy sesję
                     state.shutdown_requested = True
                     break
                 if send_task in done or recv_task in done:
-                    # Błąd w jednej z części – przerywamy natychmiast
+                    # Coś się nie udało – zamykamy sesję.
                     state.shutdown_requested = True
                     break
 
-            # Sprzątanie: zamykamy połączenie z Gemini i anulujemy watchdog
+            # -------- Sprzątanie ----------
             await sess.close()
             watcher.cancel()
 
-        # Przygotowanie wyniku do zwrócenia
+        # -------- przygotowanie wyniku ----------
         spoken = "".join(state.output_transcript).strip()
-        tools = " ".join(state.pending_fc).strip()
-        log.info(
-            "gemini.session_finished",
-            duration_ms=int((time.monotonic() - self._t0) * 1000),
-            spoken_len=len(spoken),
-            tool_calls=len(state.pending_fc),
-            session=self.session_id,
-        )
+        tools  = " ".join(state.pending_fc).strip()
+        log.info("gemini.session_finished",
+                 duration_ms=int((time.monotonic() - self._t0) * 1000),
+                 spoken_len=len(spoken),
+                 tool_calls=len(state.pending_fc),
+                 session=self.session_id)
+
         return GeminiTurnResult(
             spoken_text=spoken,
             tool_calls=tools,
@@ -723,44 +592,82 @@ class GeminiSession:
         )
 
     # ------------------------------------------------------------------
-    # 6️⃣ Prosty wrapper do wyszukiwania w internecie (używany jako tool)
+    # 6️⃣ Wyszukiwanie z fallbackiem (Google → DuckDuckGo)
     # ------------------------------------------------------------------
-    async def _do_search(self, query: str) -> dict:
-        """Wykorzystuje ``ai_common.web_search`` – zwraca dict wyników."""
-        return await web_search(query, self.client)
+    async def _search_with_fallback(self, query: str) -> dict:
+        """
+        Najpierw próbuje użyć ``web_search`` (Google + Gemini).
+        Jeśli zwróci błąd 429, przełącza się na DuckDuckGo.
+        Zwraca zawsze słownik ``{'status': ..., 'content': ...}``.
+        """
+        try:
+            return await web_search(query, self.client)      # Twoja funkcja w ai_common
+        except Exception as exc:
+            # Sprawdzamy, czy to limit Gemini
+            if isinstance(exc, genai.exceptions.RateLimitError) or (
+                isinstance(exc, genai.exceptions.GoogleAPIError) and
+                getattr(exc, "status_code", None) == 429
+            ):
+                log.warning("gemini.search.quota_exhausted",
+                            query=query,
+                            session=self.session_id)
+                # ----- fallback to DuckDuckGo -----------------
+                try:
+                    return await self._duckduckgo_search(query)
+                except Exception as e2:
+                    log.error("gemini.search.duckduckgo_failed",
+                              error=str(e2),
+                              session=self.session_id)
+                    return {"status": "error",
+                            "message": "Nie udało się wykonać wyszukiwania – quota wyczerpana."}
+            else:
+                # Inny nieoczekiwany błąd – propagujemy dalej
+                raise
 
+    async def _duckduckgo_search(self, query: str) -> dict:
+        """Minimalny, szybki fallback – zapytanie HTTP do DuckDuckGo (JSON)."""
+        import httpx
+        url = "https://duckduckgo.com/jslite"
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.post(url, json={"q": query})
+            data = resp.json()
+        # Zwracamy pierwszy wynik w prostym formacie:
+        if data.get("results"):
+            first = data["results"][0]
+            return {
+                "status": "ok",
+                "title": first.get("title", ""),
+                "link": first.get("url", ""),
+                "snippet": first.get("description", ""),
+            }
+        return {"status": "error", "message": "Brak wyników w DuckDuckGo"}
 
 # ----------------------------------------------------------------------
-#  PRZYKŁADOWE UŻYCIE (do wklejenia w innym module)
+#  PRZYKŁADOWE UŻYCIE (do uruchomienia bez front‑endu)
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     """
-    Minimalny test uruchamiany „na sucho”.  Nie wymaga prawdziwego
-    strumienia audio – po prostu odczytuje kilka przykładowych PCM‑chunków
-    z pliku i wyświetla wynik w konsoli.
+    Demonstruje działanie w trybie “dry‑run”.  Nie wymaga prawdziwego mikrafonu –
+    generuje sztuczne PCM‑chunki i wypisuje rezultat na konsolę.
     """
-    import sys
-
     async def dummy_function(name: str, args: dict) -> dict:
-        """Przykładowa funkcja, którą można podpiąć do ``on_function_call``."""
-        print(f"[dummy] called {name} with {args!r}")
+        print(f"[dummy] {name} -> {args}")
         await asyncio.sleep(0.1)
         return {"status": "ok", "message": f"Executed {name}"}
 
     async def fake_audio_source() -> AsyncGenerator[bytes, None]:
-        """Generuje kilka losowych chunków PCM (16‑bit, mono, 16 kHz)."""
+        """5 losowych chunków (po 0,2 s każdy)."""
         for _ in range(5):
-            # 0.2 s czystego szumu – wystarczy do demonstracji
-            yield os.urandom(int(0.2 * PCM_RATE * 2))  # 2 bajty na próbkę
+            # 0.2 s czystego szumu
+            yield os.urandom(int(0.2 * PCM_RATE * 2))   # 2 bajty na próbkę
             await asyncio.sleep(0.2)
 
     async def audio_sink(chunk: bytes) -> None:
-        """W tym przykładzie po prostu liczy liczbę odebranych chunków."""
-        print(f"[audio_sink] got {len(chunk)} B")
+        print(f"[audio_sink] received {len(chunk)} B")
 
     async def run_demo():
         client = genai.GenerativeModel(GEMINI_MODEL).client
-        session = GeminiSession(
+        sess = GeminiSession(
             client=client,
             entity_list="",
             room_lights={},
@@ -768,10 +675,9 @@ if __name__ == "__main__":
             history=[],
             on_function_call=dummy_function,
         )
-        result = await session.stream_audio(fake_audio_source(), audio_sink)
+        result = await sess.stream_audio(fake_audio_source(), audio_sink)
         print("\n=== RESULT ===")
-        print("Spoken:", result.spoken_text)
-        print("Tools :", result.tool_calls)
-        print("Audio chunks:", len(result.audio_chunks))
-
+        print("Spoken :", result.spoken_text)
+        print("Tools  :", result.tool_calls)
+        print("Audio  :", len(result.audio_chunks), "chunks")
     asyncio.run(run_demo())

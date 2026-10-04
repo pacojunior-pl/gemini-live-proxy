@@ -1,4 +1,4 @@
-# Gemini Live Proxy Documentation
+# Gemini Live Proxy Documentation ver Paco
 
 Gemini Live Proxy connects Home Assistant Voice PE firmware to the Gemini Live API.
 

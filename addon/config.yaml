@@ -1,5 +1,5 @@
-name: "Gemini Live Proxy"
-slug: gemini_live_proxy
+name: "Gemini Live Proxy vPaco"
+slug: gemini_live_proxy_vPaco
 version: "1.7.1"
 description: "WebSocket proxy between ESP32 Voice PE and Gemini Live API"
 image: "ghcr.io/pacojunior-pl/gemini-live-proxy-{arch}"

@@ -422,7 +422,7 @@ async def web_search(query: str, gemini_client=None) -> dict:
         from google.genai import types
 
         response = await gemini_client.aio.models.generate_content(
-            model="gemini-3.8-flash",
+            model="gemini-3.1-flash-lite",
             contents=f"{query}. Answer in one sentence in {ASSISTANT_RESPONSE_LANGUAGE}.",
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],

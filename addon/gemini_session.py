@@ -8,6 +8,7 @@ from typing import AsyncGenerator, Callable, Awaitable
 
 from google import genai
 from google.genai import types
+from google.genai import errors
 
 from ai_common import (  # noqa: F401 - re-exported for callers and tests
     ASSISTANT_GENDER,
@@ -28,7 +29,7 @@ from ai_common import (  # noqa: F401 - re-exported for callers and tests
 )
 
 def _cfg(name: str, default: str) -> str:
-    """bashio hands unset add-on options through as the literal string "null"."""
+    """bashio hands unset add-on options through as the literal string \"null\"."""
     value = os.getenv(name, "").strip()
     return default if not value or value.lower() == "null" else value
 
@@ -161,11 +162,6 @@ class GeminiSession:
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             realtime_input_config=types.RealtimeInputConfig(
-                # Manual activity detection: the proxy already runs its own VAD and cuts the
-                # mic stream. Gemini's own auto-VAD then never sees the turn end (the audio
-                # just stops) and waits forever — only emitting session_resumption_update —
-                # until the session times out. We disable auto-VAD and send explicit
-                # activity_start/activity_end so the turn ends deterministically.
                 automatic_activity_detection=types.AutomaticActivityDetection(disabled=True),
                 activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
             ),
@@ -192,7 +188,6 @@ class GeminiSession:
                         chunk_n += 1
                         if chunk_n == 1:
                             debug_log("  [gemini] Sending audio to Gemini...")
-                            # Manual VAD: mark start of user activity before the first chunk.
                             await session.send_realtime_input(activity_start=types.ActivityStart())
                         
                         await session.send_realtime_input(
@@ -201,7 +196,6 @@ class GeminiSession:
                     
                     if chunk_n > 0:
                         debug_log("  [gemini] Audio source ended. Sending activity_end.")
-                        # Manual VAD: informujemy Gemini, że użytkownik skończył mówić
                         await session.send_realtime_input(activity_end=types.ActivityEnd())
                 except asyncio.CancelledError:
                     pass
@@ -210,22 +204,14 @@ class GeminiSession:
                 finally:
                     send_done = True
 
-            # Task 2: Receive responses from Gemini (runs until the last turn completes)
+            # Task 2: Receive responses from Gemini
             responding_signaled = False
             tool_tasks: set[asyncio.Task] = set()
             tools_running = 0
-            
-            # NON_BLOCKING tools: the model ends its turn right after the tool
-            # call and speaks the result in a NEW turn once we send the response. Track
-            # when the last response went out and when audio last arrived, so a turn end
-            # only ends the session when no spoken follow-up is still owed.
             reply_owed = False
             last_response_at = 0.0
             last_audio_at = 0.0
             turn_open = False
-            
-            # Set by a finished tool run, so a quiet (chime-only) result can end the
-            # session at once instead of waiting out an idle timeout.
             tools_done = asyncio.Event()
 
             async def run_tools(function_calls):
@@ -236,13 +222,11 @@ class GeminiSession:
                         if fc.name == "search_web":
                             return await self._do_search(args_dict.get("query", ""))
                         return await self.on_function_call(fc.name, args_dict)
-                    except Exception as e:  # noqa: BLE001 - the model must still get an answer
+                    except Exception as e:
                         print(f"  [gemini] TOOL ERROR {fc.name}: {e}", flush=True)
                         return {"status": "error", "message": str(e)}
 
                 try:
-                    # Calls in one batch (e.g. two rooms at once) run in parallel, so
-                    # the reply waits for the slowest one, not for their sum.
                     results = list(zip(function_calls, await asyncio.gather(
                         *(run_one(fc) for fc in function_calls))))
                     quiet = QUIET_CONFIRMATIONS and all(is_quiet_success(fc.name, r) for fc, r in results)
@@ -291,7 +275,6 @@ class GeminiSession:
                         if next_msg not in done:
                             if tools_waiter in done:
                                 tools_done.clear()
-                                # All tools finished, nothing left to say, model idle.
                                 if not tools_running and not reply_owed and not turn_open:
                                     debug_log(f"  [gemini] Quiet tool result, ending "
                                               f"({(time.monotonic()-t0)*1000:.0f}ms)")
@@ -305,14 +288,20 @@ class GeminiSession:
                             break
                         try:
                             message = next_msg.result()
-                        except StopAsyncIteration:
-                            # The SDK's receive() iterator ends at every turn_complete.
+                        except (StopAsyncIteration, errors.APIError) as e:
+                            # Przechwytujemy czyste zamknięcie połączenia WebSocket (Status 1000) zgłaszane jako APIError
+                            if isinstance(e, errors.APIError) and getattr(e, 'code', None) == 1000:
+                                debug_log("  [gemini] Server closed the WebSocket normally (Status 1000).")
+                                next_msg = None
+                                break
+                                
                             next_msg = None
                             if tools_running or reply_owed or turn_open:
                                 debug_log("  [gemini] Turn iterator ended, but tools/reply pending. Re-subscribing...")
                                 messages = session.receive().__aiter__()
                                 continue
                             break
+                        
                         next_msg = None
 
                         msg_fields = [
@@ -341,9 +330,8 @@ class GeminiSession:
                             
                             if sc.model_turn:
                                 turn_open = True
-                                reply_owed = False # Model zaczął odpowiadać, zdejmujemy oczekiwanie
+                                reply_owed = False
                                 
-                                # Signal that Gemini started responding (stop mic streaming)
                                 if not responding_signaled:
                                     responding_signaled = True
                                     if self.on_responding:
@@ -357,15 +345,13 @@ class GeminiSession:
                                     elif part.text:
                                         response_text_parts.append(part.text)
                                         
-                            # 1. Obsługa przerwania wypowiedzi przez użytkownika (Barge-in)
                             if sc.interrupted:
                                 debug_log("  [gemini] User interrupted. Clearing local buffers.")
                                 response_audio_chunks.clear()
                                 reply_owed = False
                                 turn_open = False
-                                await on_audio_out(b"") # Przesyłamy pusty bajt jako sygnał wyciszenia
+                                await on_audio_out(b"")
                                 
-                            # 2. Obsługa końca tury ze strony Gemini
                             if sc.turn_complete:
                                 debug_log(f"  [gemini] Turn complete from Gemini ({(time.monotonic()-t0)*1000:.0f}ms)")
                                 turn_open = False
@@ -373,9 +359,8 @@ class GeminiSession:
                                     debug_log("  [gemini] Session successfully complete. Exiting loop.")
                                     break
 
-                        # 3. Odebranie żądania wywołania funkcji (Tool Call)
                         if message.tool_call is not None and message.tool_call.function_calls:
-                            turn_open = False # Narzędzie zamyka bieżącą generację audio
+                            turn_open = False
                             f_calls = message.tool_call.function_calls
                             
                             for fc in f_calls:
@@ -391,11 +376,17 @@ class GeminiSession:
                 except Exception as e:
                     debug_log(f"  [gemini] Critical error in receive loop: {e}")
                 finally:
+                    # Zapobiega wyciekowi 'Task exception was never retrieved'
+                    if next_msg and not next_msg.done():
+                        next_msg.cancel()
+                        try:
+                            await next_msg
+                        except Exception:
+                            pass
                     for task in list(tool_tasks):
                         if not task.done():
                             task.cancel()
 
-            # Uruchomienie zadań w pętli zdarzeń proxy
             send_task = asyncio.create_task(send_audio())
             receive_task = asyncio.create_task(receive_response())
             
@@ -405,14 +396,11 @@ class GeminiSession:
                 send_task.cancel()
                 receive_task.cancel()
 
-            # Budowanie podsumowania dla celów historii konwersacji
             user_said = "".join(input_transcript_parts).strip()
             model_said = "".join(output_transcript_parts).strip()
             duration = time.monotonic() - t0
             
             debug_log(f"  [gemini] Session finished in {duration:.2f}s.")
-            debug_log(f"  [gemini] User: {user_said}")
-            debug_log(f"  [gemini] Model: {model_said}")
             
             summary = f"User: {user_said} | Model: {model_said}"
             if function_calls_made:
